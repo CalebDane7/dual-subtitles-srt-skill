@@ -19,12 +19,15 @@ The skill also forces verification. It checks cue overlaps, line count, blank or
 
 It also includes a safe timing-shift workflow for cases where subtitles are early or late. The shift command moves every active sidecar for the movie together, backs up the old files, records the adjustment, and validates the result so English and Indonesian do not drift apart.
 
+The skill now checks the media layer too. Before changing subtitles, agents can probe audio/video stream start times and sync-related metadata so they do not mistake an out-of-sync movie encode for an SRT timing problem.
+
 ## What It Is For
 
 - Creating dual English and Indonesian SRT sidecars.
 - Rebuilding broken dual subtitles that overlap vertically.
 - Translating English subtitle cues into Indonesian while keeping the same timing.
 - Aligning a matched Indonesian SRT to an English timing base when translation is not available.
+- Probing whether the movie's audio/video streams show a mux-level timing offset.
 - Correcting early or late subtitle timing after checking real movie audio.
 - Validating final `.srt` files before calling the job complete.
 - Rendering proof frames so the user can see the subtitle layout.
@@ -57,6 +60,13 @@ Use $dual-subtitles-srt to create synced English and Indonesian dual subtitles f
 - Optional: `GEMINI_API_KEY` and `google-genai` for direct translation mode.
 
 ## Timing Fixes
+
+Check the movie audio/video stream starts first:
+
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py probe-av \
+  --movie "/path/movie.mp4"
+```
 
 Use a positive shift when subtitles are early and need to appear later:
 

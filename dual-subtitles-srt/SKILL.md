@@ -1,6 +1,6 @@
 ---
 name: dual-subtitles-srt
-description: Build, repair, verify, and proof SRT subtitle files, especially dual English plus Indonesian movie subtitles. Use when Codex needs to create bilingual .srt sidecars, align English and Indonesian subtitle sources, translate English cues into Indonesian, prevent two subtitle languages from vertically overlapping, validate cue timing and line wrapping, correct subtitles that are early or late, safely shift every active sidecar SRT together, replace auto-loaded exact-basename .srt files, or render proof frames with ffmpeg.
+description: Build, repair, verify, and proof SRT subtitle files, especially dual English plus Indonesian movie subtitles. Use when Codex needs to create bilingual .srt sidecars, align English and Indonesian subtitle sources, translate English cues into Indonesian, prevent two subtitle languages from vertically overlapping, validate cue timing and line wrapping, probe audio/video stream sync before subtitle timing repairs, correct subtitles that are early or late, safely shift every active sidecar SRT together, replace auto-loaded exact-basename .srt files, or render proof frames with ffmpeg.
 ---
 
 # Dual Subtitles SRT
@@ -33,6 +33,8 @@ Never call the job complete until validation and rendered proof frames show that
    - Reject ASR or downloaded sources with giant cues, wrong language, ad/uploader lines, or major timing drift.
 
 3. Check timing when the user reports early/late subtitles.
+   - Probe the movie A/V container first with `probe-av`. If audio and video are already out of sync, do not treat SRT shifting as the root fix.
+   - Use ffprobe stream starts/tags as a fast mux sanity check, not as final lip-sync proof. Container timestamps can be clean while the encode itself still looks wrong to a human.
    - Compare real audio against several cues from the start, middle, and end before shifting.
    - Treat positive measured offset as "subtitle is early": delay the SRT by that many milliseconds.
    - Treat negative measured offset as "subtitle is late": move the SRT earlier by the absolute value.
@@ -87,6 +89,15 @@ Validate existing sidecars:
 python3 dual-subtitles-srt/scripts/dual_srt.py validate \
   --movie "/path/movie.mp4"
 ```
+
+Probe audio/video stream starts before changing subtitle timing:
+
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py probe-av \
+  --movie "/path/movie.mp4"
+```
+
+If `audio_minus_video_ms` is large, investigate or correct the media A/V sync before shifting subtitles. Negative means audio packets start before video; positive means audio starts after video. Small stream-start deltas do not prove perfect lip sync, but they prevent confusing a mux offset with an SRT problem.
 
 Shift active sidecars after measured timing proof:
 

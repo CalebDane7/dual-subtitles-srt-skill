@@ -13,6 +13,8 @@ Run this checklist before claiming a dual subtitle job is complete.
 
 ## Timing Checks
 
+- Before shifting SRT timing, run `scripts/dual_srt.py probe-av` and record `audio_minus_video_ms` plus any sync/delay/offset tags.
+- Treat ffprobe A/V starts as mux evidence only. If the user reports visible lip-sync problems, create short comparison clips or otherwise inspect playback before remuxing or shifting subtitles.
 - When the user says subtitles are early or late, sample real movie audio against cues from the beginning, middle, and end before shifting files.
 - Use measured offsets consistently: positive offset means the subtitle is early and should be delayed; negative offset means it is late and should be moved earlier.
 - Shift only the movie whose timing was proven wrong. Do not reuse one movie's offset on the whole library.

@@ -464,6 +464,51 @@ def existing_unique_paths(paths: list[Path]) -> list[Path]:
     return unique
 
 
+def ffprobe_json(movie: Path) -> dict[str, object]:
+    proc = subprocess.run(
+        [
+            "ffprobe",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            str(movie),
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return json.loads(proc.stdout)
+
+
+def float_or_none(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def stream_tags_with_sync_hints(stream: dict[str, object]) -> dict[str, object]:
+    tags = stream.get("tags")
+    if not isinstance(tags, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in tags.items()
+        if re.search(r"(?i)(delay|sync|offset)", str(key)) or re.search(r"(?i)(delay|sync|offset)", str(value))
+    }
+
+
+def stream_duration(stream: dict[str, object]) -> object:
+    tags = stream.get("tags")
+    return stream.get("duration") or (tags.get("DURATION") if isinstance(tags, dict) else None)
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -532,6 +577,59 @@ def command_validate(args: argparse.Namespace) -> int:
     report = validation_report_for_movie(movie, dual)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["ok"] else 2
+
+
+def command_probe_av(args: argparse.Namespace) -> int:
+    movie = args.movie.resolve()
+    if not movie.exists():
+        raise FileNotFoundError(movie)
+    data = ffprobe_json(movie)
+    streams = data.get("streams", [])
+    if not isinstance(streams, list):
+        streams = []
+    video = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+    audio = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
+
+    video_start_s = float_or_none(video.get("start_time")) if isinstance(video, dict) else None
+    audio_start_s = float_or_none(audio.get("start_time")) if isinstance(audio, dict) else None
+    delta_ms = None
+    if video_start_s is not None and audio_start_s is not None:
+        delta_ms = round((audio_start_s - video_start_s) * 1000)
+
+    stream_summaries = []
+    for stream in streams:
+        if not isinstance(stream, dict):
+            continue
+        stream_summaries.append(
+            {
+                "index": stream.get("index"),
+                "codec_type": stream.get("codec_type"),
+                "codec_name": stream.get("codec_name"),
+                "start_time": stream.get("start_time"),
+                "duration": stream_duration(stream),
+                "sync_hint_tags": stream_tags_with_sync_hints(stream),
+            }
+        )
+
+    # WHY: Subtitle timing complaints can actually be A/V mux problems. Report
+    # container start-time evidence first so agents do not blindly shift SRTs
+    # when the media stream timing itself is suspect.
+    result = {
+        "movie": str(movie),
+        "format_duration": data.get("format", {}).get("duration") if isinstance(data.get("format"), dict) else None,
+        "primary_video_stream_index": video.get("index") if isinstance(video, dict) else None,
+        "primary_audio_stream_index": audio.get("index") if isinstance(audio, dict) else None,
+        "video_start_ms": round(video_start_s * 1000) if video_start_s is not None else None,
+        "audio_start_ms": round(audio_start_s * 1000) if audio_start_s is not None else None,
+        "audio_minus_video_ms": delta_ms,
+        "audio_video_stream_start_warning_threshold_ms": args.warn_ms,
+        "stream_start_delta_is_large": abs(delta_ms) > args.warn_ms if delta_ms is not None else None,
+        "interpretation": "negative audio_minus_video_ms means audio packets start before video; positive means audio starts after video",
+        "limit": "ffprobe stream starts and tags can catch mux offsets, but they do not prove human lip sync by themselves",
+        "streams": stream_summaries,
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 def command_shift(args: argparse.Namespace) -> int:
@@ -684,6 +782,11 @@ def main() -> int:
     validate.add_argument("--movie", required=True, type=Path)
     validate.add_argument("--srt", type=Path)
     validate.set_defaults(func=command_validate)
+
+    probe_av = sub.add_parser("probe-av")
+    probe_av.add_argument("--movie", required=True, type=Path)
+    probe_av.add_argument("--warn-ms", type=int, default=250)
+    probe_av.set_defaults(func=command_probe_av)
 
     shift = sub.add_parser("shift")
     shift.add_argument("--movie", required=True, type=Path)
