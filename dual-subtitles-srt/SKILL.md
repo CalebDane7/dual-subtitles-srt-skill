@@ -1,6 +1,6 @@
 ---
 name: dual-subtitles-srt
-description: Build, repair, verify, and proof SRT subtitle files, especially dual English plus Indonesian movie subtitles. Use when Codex needs to create bilingual .srt sidecars, align English and Indonesian subtitle sources, translate English cues into Indonesian, prevent two subtitle languages from vertically overlapping, validate cue timing and line wrapping, replace auto-loaded exact-basename .srt files, or render proof frames with ffmpeg.
+description: Build, repair, verify, and proof SRT subtitle files, especially dual English plus Indonesian movie subtitles. Use when Codex needs to create bilingual .srt sidecars, align English and Indonesian subtitle sources, translate English cues into Indonesian, prevent two subtitle languages from vertically overlapping, validate cue timing and line wrapping, correct subtitles that are early or late, safely shift every active sidecar SRT together, replace auto-loaded exact-basename .srt files, or render proof frames with ffmpeg.
 ---
 
 # Dual Subtitles SRT
@@ -32,16 +32,23 @@ Never call the job complete until validation and rendered proof frames show that
    - If no good English source exists, transcribe or extract subtitles, then inspect cue duration and gaps.
    - Reject ASR or downloaded sources with giant cues, wrong language, ad/uploader lines, or major timing drift.
 
-3. Choose Indonesian generation mode.
+3. Check timing when the user reports early/late subtitles.
+   - Compare real audio against several cues from the start, middle, and end before shifting.
+   - Treat positive measured offset as "subtitle is early": delay the SRT by that many milliseconds.
+   - Treat negative measured offset as "subtitle is late": move the SRT earlier by the absolute value.
+   - Shift only the movies/files that measurement proves are wrong. Do not apply a global offset to unrelated movies just because one file is early.
+   - Use the `shift` command so `.en.srt`, `.id.srt`, `.dual.srt`, `.dual.default.srt`, exact-basename `.srt`, and verify metadata stay together.
+
+4. Choose Indonesian generation mode.
    - Prefer direct translation from the English cue list when an API or local translation model is available. This keeps both languages on identical timestamps and prevents source-spill from unrelated Indonesian cue boundaries.
    - Use a human Indonesian SRT only when it is a close release match. Score timing overlap, filter ad/uploader lines, and verify spot cues. Source alignment is a fallback, not a shortcut.
 
-4. Build the output.
+5. Build the output.
    - Use `scripts/dual_srt.py`.
    - Write `.en.srt`, `.id.srt`, `.dual.srt`, `.dual.default.srt`, and usually exact-basename `.srt`.
    - Keep `.dual.srt`, `.dual.default.srt`, and exact-basename `.srt` byte-identical when the combined dual subtitle should auto-load.
 
-5. Validate strictly.
+6. Validate strictly.
    - No cue overlaps.
    - No cue has more than four text lines.
    - No cue is blank or single-language unless the user explicitly asks to preserve single-language title cards.
@@ -80,6 +87,16 @@ Validate existing sidecars:
 python3 dual-subtitles-srt/scripts/dual_srt.py validate \
   --movie "/path/movie.mp4"
 ```
+
+Shift active sidecars after measured timing proof:
+
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py shift \
+  --movie "/path/movie.mp4" \
+  --shift-ms 670
+```
+
+Use a positive `--shift-ms` when subtitles appear too early and must be delayed. Use a negative value when subtitles appear too late and must be moved earlier. The command backs up existing sidecars, shifts all default active SRT files for the movie, updates `.dual.verify.json` when present, and validates the final `.dual.srt`.
 
 Render proof frames:
 

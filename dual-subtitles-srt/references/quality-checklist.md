@@ -11,6 +11,14 @@ Run this checklist before claiming a dual subtitle job is complete.
 - Reject downloaded subtitle sources that start or end with uploader ads, wrong-language text, or subtitle-site credits.
 - Reject ASR sources with giant cues, very long cue durations, or obvious drift.
 
+## Timing Checks
+
+- When the user says subtitles are early or late, sample real movie audio against cues from the beginning, middle, and end before shifting files.
+- Use measured offsets consistently: positive offset means the subtitle is early and should be delayed; negative offset means it is late and should be moved earlier.
+- Shift only the movie whose timing was proven wrong. Do not reuse one movie's offset on the whole library.
+- Shift `.en.srt`, `.id.srt`, `.dual.srt`, `.dual.default.srt`, and exact-basename `.srt` together with `scripts/dual_srt.py shift`.
+- Re-run validation after every timing shift and render at least one proof frame from the shifted active `.srt`.
+
 ## Build Checks
 
 - Use one combined SRT cue per timestamp.

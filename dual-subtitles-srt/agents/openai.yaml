@@ -1,4 +1,4 @@
 interface:
   display_name: "Dual Subtitles SRT"
-  short_description: "Create verified bilingual SRT subtitles"
-  default_prompt: "Use $dual-subtitles-srt to create synced English and Indonesian dual subtitles for this movie."
+  short_description: "Create and timing-fix verified bilingual SRT subtitles"
+  default_prompt: "Use $dual-subtitles-srt to create or timing-fix synced English and Indonesian dual subtitles for this movie."

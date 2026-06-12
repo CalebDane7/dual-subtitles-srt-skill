@@ -30,6 +30,7 @@ AD_RE = re.compile(
     r"iklan|streaming|casino|\bbet\b|member of|created by|movie2shared|"
     r"ganool\.com|alih bahasa:)"
 )
+DEFAULT_SHIFT_SUFFIXES = [".en.srt", ".id.srt", ".dual.srt", ".dual.default.srt", ".srt"]
 
 
 @dataclass
@@ -60,6 +61,16 @@ def fmt_ffmpeg_time(ms: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{milli:03d}"
 
 
+def read_text_lenient(path: Path) -> str:
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Could not decode {path}")
+
+
 def clean_text(text: str) -> str:
     text = TAG_RE.sub("", text)
     text = text.replace("&nbsp;", " ").replace("\ufeff", "")
@@ -71,17 +82,7 @@ def sidecar_path(movie: Path, suffix: str) -> Path:
 
 
 def read_srt(path: Path) -> list[Cue]:
-    raw = path.read_bytes()
-    decoded = None
-    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
-        try:
-            decoded = raw.decode(encoding)
-            break
-        except UnicodeDecodeError:
-            continue
-    if decoded is None:
-        raise ValueError(f"Could not decode {path}")
-
+    decoded = read_text_lenient(path)
     normalized = decoded.replace("\r\n", "\n").replace("\r", "\n").strip()
     cues: list[Cue] = []
     for block in re.split(r"\n\s*\n", normalized):
@@ -414,6 +415,55 @@ def validate_dual(path: Path) -> dict[str, object]:
     }
 
 
+def validation_report_for_movie(movie: Path, dual: Path) -> dict[str, object]:
+    report = validate_dual(dual)
+    for suffix in (".dual.default.srt", ".srt"):
+        candidate = sidecar_path(movie, suffix)
+        if candidate.exists():
+            report[f"{suffix}_byte_match"] = sha256(dual) == sha256(candidate)
+    return report
+
+
+def shift_label(shift_ms: int) -> str:
+    direction = "plus" if shift_ms >= 0 else "minus"
+    return f"{direction}{abs(shift_ms)}ms-timing-shift"
+
+
+def shift_srt_text(text: str, shift_ms: int) -> tuple[str, dict[str, object]]:
+    starts: list[int] = []
+    ends: list[int] = []
+
+    def replace(match: re.Match[str]) -> str:
+        start = parse_time(match.groups()[:4])
+        end = parse_time(match.groups()[4:])
+        shifted_start = max(0, start + shift_ms)
+        shifted_end = max(shifted_start + 1, end + shift_ms)
+        starts.append(shifted_start)
+        ends.append(shifted_end)
+        return f"{fmt_time(shifted_start)} --> {fmt_time(shifted_end)}"
+
+    shifted, count = TIMESTAMP_RE.subn(replace, text)
+    return shifted, {
+        "cue_count": count,
+        "first_start": fmt_time(starts[0]) if starts else None,
+        "last_end": fmt_time(ends[-1]) if ends else None,
+    }
+
+
+def existing_unique_paths(paths: list[Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        if not path.exists():
+            continue
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -479,13 +529,81 @@ def command_build(args: argparse.Namespace) -> int:
 def command_validate(args: argparse.Namespace) -> int:
     movie = args.movie.resolve()
     dual = args.srt or sidecar_path(movie, ".dual.srt")
-    report = validate_dual(dual)
-    for suffix in (".dual.default.srt", ".srt"):
-        candidate = sidecar_path(movie, suffix)
-        if candidate.exists():
-            report[f"{suffix}_byte_match"] = sha256(dual) == sha256(candidate)
+    report = validation_report_for_movie(movie, dual)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["ok"] else 2
+
+
+def command_shift(args: argparse.Namespace) -> int:
+    movie = args.movie.resolve()
+    if not movie.exists():
+        raise FileNotFoundError(movie)
+    suffixes = args.suffixes or DEFAULT_SHIFT_SUFFIXES
+    candidate_paths = [sidecar_path(movie, suffix) for suffix in suffixes]
+    candidate_paths.extend(args.srt or [])
+    srt_paths = existing_unique_paths(candidate_paths)
+    if not srt_paths:
+        raise FileNotFoundError("No existing SRT files matched the requested movie/suffixes")
+
+    prepared: list[tuple[Path, str, dict[str, object]]] = []
+    for path in srt_paths:
+        shifted, stats = shift_srt_text(read_text_lenient(path), args.shift_ms)
+        if not stats["cue_count"]:
+            raise ValueError(f"No timestamp cues found in {path}")
+        prepared.append((path, shifted, stats))
+
+    label = args.label or shift_label(args.shift_ms)
+    report_path = sidecar_path(movie, ".dual.verify.json")
+    backup_paths = srt_paths + ([report_path] if report_path.exists() else [])
+    backup_dir = backup(backup_paths, label)
+
+    for path, shifted, _ in prepared:
+        path.write_text(shifted, encoding="utf-8")
+
+    dual = sidecar_path(movie, ".dual.srt")
+    validation = validation_report_for_movie(movie, dual) if dual.exists() and not args.no_validate else None
+    timing_entry = {
+        "applied_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "shift_ms": args.shift_ms,
+        "meaning": "positive values delay subtitles; negative values make subtitles earlier",
+        "label": label,
+        "backup_dir": str(backup_dir) if backup_dir else None,
+        "shifted_files": [
+            {
+                "path": str(path),
+                **stats,
+            }
+            for path, _, stats in prepared
+        ],
+    }
+
+    # WHY: Timing repairs are easy to lose track of when multiple sidecars exist.
+    # Record the exact shift beside the validation report so the movie folder
+    # itself explains why every active SRT moved together.
+    if report_path.exists():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            report = {"previous_verify_json_unparseable": str(report_path)}
+        adjustments = report.setdefault("timing_adjustments", [])
+        if isinstance(adjustments, list):
+            adjustments.append(timing_entry)
+        else:
+            report["timing_adjustments"] = [timing_entry]
+        if validation is not None:
+            report["post_shift_validation"] = validation
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    result = {
+        "movie": str(movie),
+        "shift_ms": args.shift_ms,
+        "meaning": "positive values delay subtitles; negative values make subtitles earlier",
+        "backup_dir": str(backup_dir) if backup_dir else None,
+        "shifted_files": timing_entry["shifted_files"],
+        "validation": validation,
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if validation is None or validation.get("ok") else 2
 
 
 def command_proof(args: argparse.Namespace) -> int:
@@ -566,6 +684,20 @@ def main() -> int:
     validate.add_argument("--movie", required=True, type=Path)
     validate.add_argument("--srt", type=Path)
     validate.set_defaults(func=command_validate)
+
+    shift = sub.add_parser("shift")
+    shift.add_argument("--movie", required=True, type=Path)
+    shift.add_argument("--shift-ms", required=True, type=int)
+    shift.add_argument(
+        "--suffix",
+        dest="suffixes",
+        action="append",
+        help="Sidecar suffix to shift. Repeatable. Defaults to .en.srt, .id.srt, .dual.srt, .dual.default.srt, and .srt.",
+    )
+    shift.add_argument("--srt", action="append", type=Path, help="Additional explicit SRT path to shift. Repeatable.")
+    shift.add_argument("--label", help="Backup label. Defaults to plus/minusNms-timing-shift.")
+    shift.add_argument("--no-validate", action="store_true", help="Skip post-shift validation of the movie .dual.srt.")
+    shift.set_defaults(func=command_shift)
 
     proof = sub.add_parser("proof")
     proof.add_argument("--movie", required=True, type=Path)

@@ -17,12 +17,15 @@ Indonesian line 2, if needed
 
 The skill also forces verification. It checks cue overlaps, line count, blank or single-language cues, exact-basename `.srt` auto-load copies, and rendered ffmpeg proof frames. The goal is not just to generate an SRT file, but to prove that the subtitles are synced, complete, and readable.
 
+It also includes a safe timing-shift workflow for cases where subtitles are early or late. The shift command moves every active sidecar for the movie together, backs up the old files, records the adjustment, and validates the result so English and Indonesian do not drift apart.
+
 ## What It Is For
 
 - Creating dual English and Indonesian SRT sidecars.
 - Rebuilding broken dual subtitles that overlap vertically.
 - Translating English subtitle cues into Indonesian while keeping the same timing.
 - Aligning a matched Indonesian SRT to an English timing base when translation is not available.
+- Correcting early or late subtitle timing after checking real movie audio.
 - Validating final `.srt` files before calling the job complete.
 - Rendering proof frames so the user can see the subtitle layout.
 
@@ -52,6 +55,18 @@ Use $dual-subtitles-srt to create synced English and Indonesian dual subtitles f
 - Python 3.10 or newer.
 - `ffmpeg` and `ffprobe` for media inspection and proof frames.
 - Optional: `GEMINI_API_KEY` and `google-genai` for direct translation mode.
+
+## Timing Fixes
+
+Use a positive shift when subtitles are early and need to appear later:
+
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py shift \
+  --movie "/path/movie.mp4" \
+  --shift-ms 670
+```
+
+Use a negative shift when subtitles are late and need to appear earlier. Always validate and render proof frames after shifting.
 
 ## Notes
 
