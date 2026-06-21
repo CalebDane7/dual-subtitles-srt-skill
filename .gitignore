@@ -3,3 +3,6 @@ __pycache__/
 .DS_Store
 .pytest_cache/
 *.backups/
+backups/
+.codex-backups/
+*.bak-*

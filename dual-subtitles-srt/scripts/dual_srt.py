@@ -176,6 +176,29 @@ def split_text_evenly(text: str, parts: int) -> list[str]:
     return [chunk for chunk in chunks if chunk] or [clean_text(text)]
 
 
+def pad_chunks(chunks: list[str], parts: int, fallback: str) -> list[str]:
+    # WHY: callers index chunks[0..parts-1] in lockstep for both languages. A short
+    # side can yield fewer non-empty pieces than `parts`; pad by repeating the last
+    # piece so every sub-cue stays bilingual (never blank) and indexing never raises.
+    chunks = [c for c in chunks if c] or [clean_text(fallback)]
+    while len(chunks) < parts:
+        chunks.append(chunks[-1])
+    return chunks[:parts]
+
+
+def clamp_overlaps(cues: list[Cue]) -> list[Cue]:
+    # WHY: a few source subtitles have cues whose display time overlaps (or is even out
+    # of order with) the next cue; validate() rejects any overlap. Sort by start, then
+    # trim each cue to end before the next one begins so the dual track never shows two
+    # cues at once. id_texts is keyed by cue.index, so reordering the list here does not
+    # break the English/Indonesian pairing.
+    cues.sort(key=lambda c: (c.start_ms, c.end_ms))
+    for a, b in zip(cues, cues[1:]):
+        if a.end_ms > b.start_ms:
+            a.end_ms = max(a.start_ms + 1, b.start_ms - 1)
+    return cues
+
+
 def split_bilingual_overflows(
     cues: list[Cue],
     id_texts: dict[int, str],
@@ -199,6 +222,10 @@ def split_bilingual_overflows(
             en_chunks = split_text_evenly(cue.text, parts)
         if len(id_chunks) != parts:
             id_chunks = split_text_evenly(id_texts[cue.index], parts)
+        # WHY: split_text_evenly drops empty pieces, so a one-word side paired with a
+        # long line can return fewer than `parts` chunks and crash chunks[i] below.
+        en_chunks = pad_chunks(en_chunks, parts, cue.text)
+        id_chunks = pad_chunks(id_chunks, parts, id_texts[cue.index])
 
         duration = max(1, cue.end_ms - cue.start_ms)
         cursor = cue.start_ms
@@ -267,6 +294,7 @@ def translate_with_gemini(cues: list[Cue], cache_path: Path, model: str, chunk_s
         return translated
 
     client = genai.Client(api_key=api_key)
+    models = [item.strip() for item in model.split(",") if item.strip()] or [model]
     schema = {
         "type": "object",
         "properties": {
@@ -292,30 +320,174 @@ def translate_with_gemini(cues: list[Cue], cache_path: Path, model: str, chunk_s
             "Return JSON only with translations[].index and translations[].id. Do not add timestamps or markdown.\n\n"
             + json.dumps({"cues": payload}, ensure_ascii=False)
         )
-        for attempt in range(1, 4):
-            try:
-                response = client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        responseMimeType="application/json",
-                        responseSchema=schema,
-                    ),
-                )
-                data = json.loads(response.text)
-                result = {int(item["index"]): clean_text(str(item["id"])) for item in data["translations"]}
+        last_exc: Exception | None = None
+        result: dict[int, str] | None = None
+        for model_name in models:
+            for attempt in range(1, 3):
+                try:
+                    # WHY: Gemini free-tier quotas can be per model. Accepting a
+                    # comma-separated model pool lets a long movie batch keep moving
+                    # without dropping the cache-backed, structured JSON translation
+                    # path or falling back to unsafe hand-written subtitle text.
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.1,
+                            responseMimeType="application/json",
+                            responseSchema=schema,
+                        ),
+                    )
+                    data = json.loads(response.text)
+                    result = {int(item["index"]): clean_text(str(item["id"])) for item in data["translations"]}
+                    print(f"translated chunk with Gemini model {model_name}", flush=True)
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    text = str(exc)
+                    quota_like = "RESOURCE_EXHAUSTED" in text or "429" in text or "quota" in text.lower()
+                    if quota_like:
+                        print(f"Gemini model {model_name} quota/error; trying next model", flush=True)
+                        break
+                    if attempt == 2:
+                        print(f"Gemini model {model_name} failed; trying next model", flush=True)
+                        break
+                    time.sleep(2 * attempt)
+            if result is not None:
                 break
-            except Exception:
-                if attempt == 3:
-                    raise
-                time.sleep(2 * attempt)
+        if result is None:
+            assert last_exc is not None
+            raise last_exc
         expected = {cue.index for cue in chunk}
         if set(result) != expected:
             raise ValueError(f"Translation index mismatch: expected {len(expected)} got {len(result)}")
         translated.update(result)
         cache_path.write_text(json.dumps(translated, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"translated {len(translated)}/{len(cues)} cues", flush=True)
+
+    return translated
+
+
+def parse_json_object(text: str) -> dict[str, object]:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(text[start : end + 1])
+
+
+def translate_with_gemini_cli(cues: list[Cue], cache_path: Path, model: str, chunk_size: int) -> dict[int, str]:
+    cached = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
+    translated = {int(k): str(v) for k, v in cached.items()}
+    missing = [cue for cue in cues if cue.index not in translated]
+    if not missing:
+        return translated
+
+    if not shutil.which("gemini"):
+        raise RuntimeError("gemini CLI is not available for --translate gemini-cli")
+
+    for offset in range(0, len(missing), chunk_size):
+        chunk = missing[offset : offset + chunk_size]
+        payload = [{"index": cue.index, "en": cue.text} for cue in chunk]
+        prompt = (
+            "Translate these English movie subtitle cues into natural Indonesian. "
+            "Preserve complete meaning, names, numbers, quoted code words, title cards, "
+            "military terms, and proper names. Keep each cue concise but complete. "
+            "Return JSON only with translations[].index and translations[].id. "
+            "Do not add timestamps, markdown, comments, or extra keys.\n\n"
+            + json.dumps({"cues": payload}, ensure_ascii=False)
+        )
+        cmd = ["gemini", "-p", prompt, "--output-format", "text"]
+        if model and model.lower() not in {"default", "gemini-cli-default"}:
+            cmd[1:1] = ["-m", model]
+
+        for attempt in range(1, 4):
+            try:
+                # WHY: this workstation often has Gemini CLI OAuth available but no
+                # exported GEMINI_API_KEY. Keep this headless CLI path cache-backed so
+                # large subtitle batches can still be rebuilt without exposing secrets
+                # or bypassing the normal four-line validation/backup writer below.
+                proc = subprocess.run(
+                    cmd,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    timeout=300,
+                )
+                data = parse_json_object(proc.stdout)
+                result = {int(item["index"]): clean_text(str(item["id"])) for item in data["translations"]}
+                break
+            except Exception:
+                if attempt == 3:
+                    raise
+                time.sleep(5 * attempt)
+        expected = {cue.index for cue in chunk}
+        if set(result) != expected:
+            raise ValueError(f"Translation index mismatch: expected {len(expected)} got {len(result)}")
+        translated.update(result)
+        cache_path.write_text(json.dumps(translated, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"translated {len(translated)}/{len(cues)} cues via gemini CLI", flush=True)
+
+    return translated
+
+
+def translate_with_mantis_antigravity(cues: list[Cue], cache_path: Path, model: str, chunk_size: int) -> dict[int, str]:
+    cached = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
+    translated = {int(k): str(v) for k, v in cached.items()}
+    missing = [cue for cue in cues if cue.index not in translated]
+    if not missing:
+        return translated
+
+    if not shutil.which("mantis"):
+        raise RuntimeError("mantis CLI is not available for --translate mantis-antigravity")
+
+    for offset in range(0, len(missing), chunk_size):
+        chunk = missing[offset : offset + chunk_size]
+        payload = [{"index": cue.index, "en": cue.text} for cue in chunk]
+        prompt = (
+            "Translate these English movie subtitle cues into natural Indonesian. "
+            "Preserve complete meaning, names, numbers, quoted code words, title cards, "
+            "military terms, and proper names. Keep each cue concise but complete. "
+            "Return JSON only with translations[].index and translations[].id. "
+            "Do not add timestamps, commentary, markdown explanation, or extra keys.\n\n"
+            + json.dumps({"cues": payload}, ensure_ascii=False)
+        )
+        cmd = ["mantis", "antigravity", "--print-timeout", "5m", "--print", prompt]
+
+        for attempt in range(1, 4):
+            try:
+                # WHY: Gemini CLI OAuth can be unavailable or capped while this
+                # workstation still has Mantis Antigravity configured with the
+                # user's preferred Gemini lane. Keep this path cache-backed and
+                # parse-strict so subtitle batches can resume without losing the
+                # protected four-line validator/sidecar writer below.
+                proc = subprocess.run(
+                    cmd,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    timeout=360,
+                )
+                data = parse_json_object(proc.stdout)
+                result = {int(item["index"]): clean_text(str(item["id"])) for item in data["translations"]}
+                break
+            except Exception:
+                if attempt == 3:
+                    raise
+                time.sleep(8 * attempt)
+        expected = {cue.index for cue in chunk}
+        if set(result) != expected:
+            raise ValueError(f"Translation index mismatch: expected {len(expected)} got {len(result)}")
+        translated.update(result)
+        cache_path.write_text(json.dumps(translated, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"translated {len(translated)}/{len(cues)} cues via Mantis Antigravity", flush=True)
 
     return translated
 
@@ -351,6 +523,7 @@ def align_indonesian(en_cues: list[Cue], id_source: Path, shift_ms: int) -> tupl
     for id_cue in id_cues:
         shifted_start = id_cue.start_ms + shift_ms
         shifted_end = id_cue.end_ms + shift_ms
+        id_duration = max(1, shifted_end - shifted_start)
         overlaps: list[tuple[Cue, int]] = []
         for en_cue in en_cues:
             overlap = max(0, min(en_cue.end_ms, shifted_end) - max(en_cue.start_ms, shifted_start))
@@ -358,6 +531,14 @@ def align_indonesian(en_cues: list[Cue], id_source: Path, shift_ms: int) -> tupl
                 overlaps.append((en_cue, overlap))
         if not overlaps:
             continue
+        # WHY: A tiny boundary-touch overlap (an ID cue ending right as the next EN
+        # cue starts) used to leak a word of the Indonesian line into the wrong EN
+        # cue, so the Indonesian no longer matched the English stacked above it.
+        # Keep only overlaps that are a real share of the ID cue (>=30%) or >=250ms;
+        # if none qualify, attach the whole ID cue to its single best-overlap EN cue.
+        # This removes cross-cue word bleed while still splitting genuine multi-cue spans.
+        strong = [(c, o) for c, o in overlaps if o >= 0.30 * id_duration or o >= 250]
+        overlaps = strong or [max(overlaps, key=lambda co: co[1])]
         consumed += 1
         for (en_cue, _), part in zip(overlaps, split_by_weights(id_cue.text, [o for _, o in overlaps])):
             if part:
@@ -522,12 +703,32 @@ def command_build(args: argparse.Namespace) -> int:
     if args.translate == "gemini":
         id_texts = translate_with_gemini(en_cues, sidecar_path(movie, ".id.translation-cache.json"), args.model, args.chunk_size)
         alignment_report: dict[str, object] = {"translation_model": args.model}
+    elif args.translate == "gemini-cli":
+        id_texts = translate_with_gemini_cli(
+            en_cues,
+            sidecar_path(movie, ".id.translation-cache.json"),
+            args.model,
+            args.chunk_size,
+        )
+        alignment_report = {"translation_model": args.model, "translation_transport": "gemini-cli"}
+    elif args.translate == "mantis-antigravity":
+        id_texts = translate_with_mantis_antigravity(
+            en_cues,
+            sidecar_path(movie, ".id.translation-cache.json"),
+            args.model,
+            args.chunk_size,
+        )
+        alignment_report = {
+            "translation_model": args.model,
+            "translation_transport": "mantis-antigravity",
+        }
     elif args.indonesian_source:
         id_texts, alignment_report = align_indonesian(en_cues, args.indonesian_source, args.shift_ms)
     else:
         raise ValueError("Use --translate gemini or provide --indonesian-source")
 
     en_cues, id_texts = split_bilingual_overflows(en_cues, id_texts, args.english_width, args.indonesian_width)
+    en_cues = clamp_overlaps(en_cues)
 
     en_out = sidecar_path(movie, ".en.srt")
     id_out = sidecar_path(movie, ".id.srt")
@@ -768,7 +969,7 @@ def main() -> int:
     build.add_argument("--english-source", required=True, type=Path)
     build.add_argument("--indonesian-source", type=Path)
     build.add_argument("--shift-ms", type=int, default=0)
-    build.add_argument("--translate", choices=["gemini"])
+    build.add_argument("--translate", choices=["gemini", "gemini-cli", "mantis-antigravity"])
     build.add_argument("--model", default="gemini-3.1-flash-lite")
     build.add_argument("--chunk-size", type=int, default=250)
     build.add_argument("--english-width", type=int, default=42)

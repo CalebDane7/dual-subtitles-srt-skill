@@ -43,6 +43,9 @@ Never call the job complete until validation and rendered proof frames show that
 
 4. Choose Indonesian generation mode.
    - Prefer direct translation from the English cue list when an API or local translation model is available. This keeps both languages on identical timestamps and prevents source-spill from unrelated Indonesian cue boundaries.
+   - For long batches, `--translate gemini` accepts a comma-separated model pool in `--model`; the script tries the next model when a provider quota/error blocks the current model.
+   - Use `--translate gemini-cli` when the local Gemini CLI OAuth path is available but no `GEMINI_API_KEY` is exported.
+   - Use `--translate mantis-antigravity` when the Mantis Antigravity Gemini lane is the available translation path.
    - Use a human Indonesian SRT only when it is a close release match. Score timing overlap, filter ad/uploader lines, and verify spot cues. Source alignment is a fallback, not a shortcut.
 
 5. Build the output.
@@ -66,7 +69,31 @@ python3 dual-subtitles-srt/scripts/dual_srt.py build \
   --movie "/path/movie.mp4" \
   --english-source "/path/movie.en.srt" \
   --translate gemini \
-  --model gemini-3.1-flash-lite \
+  --model gemini-3.1-flash-lite,gemini-2.5-flash-lite \
+  --make-default \
+  --make-plain
+```
+
+Build from English SRT with the local Gemini CLI OAuth path:
+
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py build \
+  --movie "/path/movie.mp4" \
+  --english-source "/path/movie.en.srt" \
+  --translate gemini-cli \
+  --model default \
+  --make-default \
+  --make-plain
+```
+
+Build from English SRT through Mantis Antigravity:
+
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py build \
+  --movie "/path/movie.mp4" \
+  --english-source "/path/movie.en.srt" \
+  --translate mantis-antigravity \
+  --model auto \
   --make-default \
   --make-plain
 ```
