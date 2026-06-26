@@ -255,6 +255,7 @@ python3 dual-subtitles-srt/scripts/dual_srt.py build \
 ```
 
 Translation output is cached beside the movie as `.id.translation-cache.json`, so interrupted batches can resume without paying for the same cue translations again.
+The cache is treated as untrusted on every rebuild: if a translated cue is just a cue number, timestamp fragment, or numeric placeholder while the English cue has words, the script discards that cached value and retranslates it.
 
 ## Timing repair
 
@@ -285,6 +286,7 @@ The validator checks:
 - No cue has more than four visual lines.
 - No blank cues.
 - No unintended single-language cues.
+- No translated/lower-language cue is just a cue number or numeric placeholder when the English cue has words.
 - `.dual.default.srt` byte-matches `.dual.srt`.
 - Exact-basename `.srt` byte-matches `.dual.srt` when auto-loading is enabled.
 
@@ -297,6 +299,8 @@ Example validator output:
   "overlap_count": 0,
   "too_many_line_cues": [],
   "single_language_or_blank_cues": [],
+  "numeric_translation_line_cues": [],
+  "translation_sidecar_issue_count": 0,
   "ok": true,
   ".dual.default.srt_byte_match": true,
   ".srt_byte_match": true
@@ -340,6 +344,7 @@ Do not overwrite working sidecars without backups.
 - Do not apply one movie's timing shift to a whole library.
 - Do not treat mux-level stream timestamps as full lip-sync proof.
 - Do not copy partial translation output into a movie folder after a provider failure.
+- Do not accept translated subtitle lines that only echo cue numbers, even if timing and four-line layout validation pass.
 
 For long batches, build in a temp folder first, validate, then copy the finished sidecars into the movie folder.
 

@@ -37,6 +37,7 @@ Run this checklist before claiming a dual subtitle job is complete.
 - Assert max visual lines per cue is `4`.
 - Assert zero blank cues.
 - Assert zero single-language cues unless explicitly accepted.
+- Assert zero translated/lower-language numeric placeholders when the English cue has words.
 - Confirm `.dual.default.srt` byte-matches `.dual.srt`.
 - Confirm exact-basename `.srt` byte-matches `.dual.srt` when auto-loading is desired.
 

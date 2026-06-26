@@ -30,6 +30,8 @@ AD_RE = re.compile(
     r"iklan|streaming|casino|\bbet\b|member of|created by|movie2shared|"
     r"ganool\.com|alih bahasa:)"
 )
+ALPHA_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]")
+NUMERIC_PLACEHOLDER_RE = re.compile(r"^[\s\d.,:;+\-/#()]+$")
 DEFAULT_SHIFT_SUFFIXES = [".en.srt", ".id.srt", ".dual.srt", ".dual.default.srt", ".srt"]
 
 
@@ -75,6 +77,91 @@ def clean_text(text: str) -> str:
     text = TAG_RE.sub("", text)
     text = text.replace("&nbsp;", " ").replace("\ufeff", "")
     return " ".join(text.split())
+
+
+def has_alpha(text: str) -> bool:
+    return bool(ALPHA_RE.search(text))
+
+
+def looks_numeric_placeholder(text: str) -> bool:
+    cleaned = clean_text(text)
+    return bool(cleaned) and any(ch.isdigit() for ch in cleaned) and not has_alpha(cleaned) and bool(NUMERIC_PLACEHOLDER_RE.fullmatch(cleaned))
+
+
+def translated_text_issue(cue_index: int, source_text: str, translated_text: str) -> str | None:
+    cleaned = clean_text(translated_text)
+    if not cleaned:
+        return "blank"
+    if "-->" in cleaned or TIMESTAMP_RE.search(cleaned):
+        return "timestamp_or_srt_metadata"
+    if has_alpha(source_text) and looks_numeric_placeholder(cleaned):
+        digits = re.sub(r"\D", "", cleaned)
+        if digits == str(cue_index):
+            return "matches_cue_index"
+        return "numeric_placeholder"
+    return None
+
+
+def translation_quality_issues(cues: list[Cue], translated_texts: dict[int, str]) -> list[dict[str, object]]:
+    issues: list[dict[str, object]] = []
+    for cue in cues:
+        if cue.index not in translated_texts:
+            issues.append({"index": cue.index, "reason": "missing", "source": cue.text, "translation": ""})
+            continue
+        translation = clean_text(str(translated_texts[cue.index]))
+        issue = translated_text_issue(cue.index, cue.text, translation)
+        if issue:
+            issues.append({"index": cue.index, "reason": issue, "source": cue.text, "translation": translation})
+    return issues
+
+
+def assert_valid_translated_texts(cues: list[Cue], translated_texts: dict[int, str], context: str) -> None:
+    issues = translation_quality_issues(cues, translated_texts)
+    if issues:
+        preview = json.dumps(issues[:20], ensure_ascii=False)
+        raise ValueError(f"{context} contains invalid translated subtitle text: {preview}")
+
+
+def translated_item_text(item: dict[str, object]) -> str:
+    # WHY: two-letter language fields such as "id" can be interpreted as an
+    # identifier and filled with cue numbers. Prefer generic "translation" for
+    # every target language, while still accepting newer Indonesian-specific and
+    # old cache-compatible provider responses.
+    value = item.get("translation", item.get("indonesian", item.get("id", "")))
+    return clean_text(str(value))
+
+
+def read_translation_cache(cache_path: Path, cues: list[Cue]) -> dict[int, str]:
+    cached = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
+    cues_by_index = {cue.index: cue for cue in cues}
+    translated: dict[int, str] = {}
+    dropped: list[dict[str, object]] = []
+
+    for key, value in cached.items():
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            continue
+        cue = cues_by_index.get(index)
+        if cue is None:
+            continue
+        cleaned = clean_text(str(value))
+        issue = translated_text_issue(index, cue.text, cleaned)
+        if issue:
+            dropped.append({"index": index, "reason": issue, "source": cue.text, "translation": cleaned})
+            continue
+        translated[index] = cleaned
+
+    if dropped:
+        # WHY: provider/cache output has previously returned cue numbers as the
+        # translated language. Treat cache as untrusted so bad values are
+        # retranslated instead of being written into fresh dual subtitle sidecars.
+        print(
+            f"discarded {len(dropped)} invalid cached translated subtitles from {cache_path}: "
+            + json.dumps(dropped[:10], ensure_ascii=False),
+            flush=True,
+        )
+    return translated
 
 
 def sidecar_path(movie: Path, suffix: str) -> Path:
@@ -287,8 +374,7 @@ def translate_with_gemini(cues: list[Cue], cache_path: Path, model: str, chunk_s
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
 
-    cached = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
-    translated = {int(k): str(v) for k, v in cached.items()}
+    translated = read_translation_cache(cache_path, cues)
     missing = [cue for cue in cues if cue.index not in translated]
     if not missing:
         return translated
@@ -302,8 +388,8 @@ def translate_with_gemini(cues: list[Cue], cache_path: Path, model: str, chunk_s
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "properties": {"index": {"type": "integer"}, "id": {"type": "string"}},
-                    "required": ["index", "id"],
+                    "properties": {"index": {"type": "integer"}, "translation": {"type": "string"}},
+                    "required": ["index", "translation"],
                 },
             }
         },
@@ -317,7 +403,9 @@ def translate_with_gemini(cues: list[Cue], cache_path: Path, model: str, chunk_s
             "Translate these English movie subtitle cues into natural Indonesian. "
             "Preserve complete meaning, names, numbers, quoted code words, title cards, "
             "military terms, and Terminator/Skynet terms. Keep each cue concise but complete. "
-            "Return JSON only with translations[].index and translations[].id. Do not add timestamps or markdown.\n\n"
+            "Return JSON only with translations[].index and translations[].translation. "
+            "The translation field must contain translated subtitle text in the target language, not the cue number. "
+            "Do not add timestamps or markdown.\n\n"
             + json.dumps({"cues": payload}, ensure_ascii=False)
         )
         last_exc: Exception | None = None
@@ -339,7 +427,7 @@ def translate_with_gemini(cues: list[Cue], cache_path: Path, model: str, chunk_s
                         ),
                     )
                     data = json.loads(response.text)
-                    result = {int(item["index"]): clean_text(str(item["id"])) for item in data["translations"]}
+                    result = {int(item["index"]): translated_item_text(item) for item in data["translations"]}
                     print(f"translated chunk with Gemini model {model_name}", flush=True)
                     break
                 except Exception as exc:
@@ -361,6 +449,7 @@ def translate_with_gemini(cues: list[Cue], cache_path: Path, model: str, chunk_s
         expected = {cue.index for cue in chunk}
         if set(result) != expected:
             raise ValueError(f"Translation index mismatch: expected {len(expected)} got {len(result)}")
+        assert_valid_translated_texts(chunk, result, f"Gemini translation chunk starting at cue {chunk[0].index}")
         translated.update(result)
         cache_path.write_text(json.dumps(translated, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"translated {len(translated)}/{len(cues)} cues", flush=True)
@@ -384,8 +473,7 @@ def parse_json_object(text: str) -> dict[str, object]:
 
 
 def translate_with_gemini_cli(cues: list[Cue], cache_path: Path, model: str, chunk_size: int) -> dict[int, str]:
-    cached = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
-    translated = {int(k): str(v) for k, v in cached.items()}
+    translated = read_translation_cache(cache_path, cues)
     missing = [cue for cue in cues if cue.index not in translated]
     if not missing:
         return translated
@@ -400,7 +488,8 @@ def translate_with_gemini_cli(cues: list[Cue], cache_path: Path, model: str, chu
             "Translate these English movie subtitle cues into natural Indonesian. "
             "Preserve complete meaning, names, numbers, quoted code words, title cards, "
             "military terms, and proper names. Keep each cue concise but complete. "
-            "Return JSON only with translations[].index and translations[].id. "
+            "Return JSON only with translations[].index and translations[].translation. "
+            "The translation field must contain translated subtitle text in the target language, not the cue number. "
             "Do not add timestamps, markdown, comments, or extra keys.\n\n"
             + json.dumps({"cues": payload}, ensure_ascii=False)
         )
@@ -422,7 +511,7 @@ def translate_with_gemini_cli(cues: list[Cue], cache_path: Path, model: str, chu
                     timeout=300,
                 )
                 data = parse_json_object(proc.stdout)
-                result = {int(item["index"]): clean_text(str(item["id"])) for item in data["translations"]}
+                result = {int(item["index"]): translated_item_text(item) for item in data["translations"]}
                 break
             except Exception:
                 if attempt == 3:
@@ -431,6 +520,7 @@ def translate_with_gemini_cli(cues: list[Cue], cache_path: Path, model: str, chu
         expected = {cue.index for cue in chunk}
         if set(result) != expected:
             raise ValueError(f"Translation index mismatch: expected {len(expected)} got {len(result)}")
+        assert_valid_translated_texts(chunk, result, f"Gemini CLI translation chunk starting at cue {chunk[0].index}")
         translated.update(result)
         cache_path.write_text(json.dumps(translated, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"translated {len(translated)}/{len(cues)} cues via gemini CLI", flush=True)
@@ -439,8 +529,7 @@ def translate_with_gemini_cli(cues: list[Cue], cache_path: Path, model: str, chu
 
 
 def translate_with_mantis_antigravity(cues: list[Cue], cache_path: Path, model: str, chunk_size: int) -> dict[int, str]:
-    cached = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
-    translated = {int(k): str(v) for k, v in cached.items()}
+    translated = read_translation_cache(cache_path, cues)
     missing = [cue for cue in cues if cue.index not in translated]
     if not missing:
         return translated
@@ -455,7 +544,8 @@ def translate_with_mantis_antigravity(cues: list[Cue], cache_path: Path, model: 
             "Translate these English movie subtitle cues into natural Indonesian. "
             "Preserve complete meaning, names, numbers, quoted code words, title cards, "
             "military terms, and proper names. Keep each cue concise but complete. "
-            "Return JSON only with translations[].index and translations[].id. "
+            "Return JSON only with translations[].index and translations[].translation. "
+            "The translation field must contain translated subtitle text in the target language, not the cue number. "
             "Do not add timestamps, commentary, markdown explanation, or extra keys.\n\n"
             + json.dumps({"cues": payload}, ensure_ascii=False)
         )
@@ -476,7 +566,7 @@ def translate_with_mantis_antigravity(cues: list[Cue], cache_path: Path, model: 
                     timeout=360,
                 )
                 data = parse_json_object(proc.stdout)
-                result = {int(item["index"]): clean_text(str(item["id"])) for item in data["translations"]}
+                result = {int(item["index"]): translated_item_text(item) for item in data["translations"]}
                 break
             except Exception:
                 if attempt == 3:
@@ -485,6 +575,7 @@ def translate_with_mantis_antigravity(cues: list[Cue], cache_path: Path, model: 
         expected = {cue.index for cue in chunk}
         if set(result) != expected:
             raise ValueError(f"Translation index mismatch: expected {len(expected)} got {len(result)}")
+        assert_valid_translated_texts(chunk, result, f"Mantis Antigravity translation chunk starting at cue {chunk[0].index}")
         translated.update(result)
         cache_path.write_text(json.dumps(translated, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"translated {len(translated)}/{len(cues)} cues via Mantis Antigravity", flush=True)
@@ -584,6 +675,13 @@ def validate_dual(path: Path) -> dict[str, object]:
     max_lines = max(len(body) for _, _, body in cues)
     too_many = [i + 1 for i, (_, _, body) in enumerate(cues) if len(body) > 4]
     single_language = [i + 1 for i, (_, _, body) in enumerate(cues) if len(body) < 2]
+    numeric_translation = [
+        i + 1
+        for i, (_, _, body) in enumerate(cues)
+        if len(body) >= 2
+        and has_alpha(" ".join(body[: max(1, len(body) - 2)]))
+        and any(looks_numeric_placeholder(line) for line in body[-min(2, len(body) - 1) :])
+    ]
     return {
         "cue_count": len(cues),
         "first_start": fmt_time(cues[0][0]),
@@ -592,7 +690,9 @@ def validate_dual(path: Path) -> dict[str, object]:
         "overlap_count": overlaps,
         "too_many_line_cues": too_many[:50],
         "single_language_or_blank_cues": single_language[:50],
-        "ok": overlaps == 0 and not too_many and not single_language and max_lines <= 4,
+        "numeric_translation_line_cues": numeric_translation[:50],
+        "numeric_indonesian_line_cues": numeric_translation[:50],
+        "ok": overlaps == 0 and not too_many and not single_language and not numeric_translation and max_lines <= 4,
     }
 
 
@@ -602,6 +702,18 @@ def validation_report_for_movie(movie: Path, dual: Path) -> dict[str, object]:
         candidate = sidecar_path(movie, suffix)
         if candidate.exists():
             report[f"{suffix}_byte_match"] = sha256(dual) == sha256(candidate)
+    en_path = sidecar_path(movie, ".en.srt")
+    id_path = sidecar_path(movie, ".id.srt")
+    if en_path.exists() and id_path.exists():
+        en_cues = read_srt(en_path)
+        id_cues = read_srt(id_path)
+        id_texts = {cue.index: cue.text for cue in id_cues}
+        sidecar_issues = translation_quality_issues(en_cues, id_texts)
+        report["translation_sidecar_issue_count"] = len(sidecar_issues)
+        report["translation_sidecar_issues"] = sidecar_issues[:50]
+        report["indonesian_sidecar_issue_count"] = len(sidecar_issues)
+        report["indonesian_sidecar_issues"] = sidecar_issues[:50]
+        report["ok"] = bool(report["ok"]) and not sidecar_issues
     return report
 
 
@@ -727,8 +839,10 @@ def command_build(args: argparse.Namespace) -> int:
     else:
         raise ValueError("Use --translate gemini or provide --indonesian-source")
 
+    assert_valid_translated_texts(en_cues, id_texts, "Translated subtitle text before writing")
     en_cues, id_texts = split_bilingual_overflows(en_cues, id_texts, args.english_width, args.indonesian_width)
     en_cues = clamp_overlaps(en_cues)
+    assert_valid_translated_texts(en_cues, id_texts, "Translated subtitle text after overflow split")
 
     en_out = sidecar_path(movie, ".en.srt")
     id_out = sidecar_path(movie, ".id.srt")

@@ -57,6 +57,7 @@ Never call the job complete until validation and rendered proof frames show that
    - No cue overlaps.
    - No cue has more than four text lines.
    - No cue is blank or single-language unless the user explicitly asks to preserve single-language title cards.
+   - No translated/lower-language cue is only a cue number, timestamp fragment, or numeric placeholder when the English cue has words.
    - The first and last cues cover the dialogue span expected for that subtitle source.
    - Render proof frames from real video frames, preferably actual four-line cues.
 
