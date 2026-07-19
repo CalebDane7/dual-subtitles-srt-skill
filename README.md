@@ -1,77 +1,399 @@
-# Dual Subtitles SRT Skill
+# Dual Subtitles for Any Movie and Any Two Languages
 
 [![GitHub stars](https://img.shields.io/github/stars/CalebDane7/dual-subtitles-srt-skill?style=social)](https://github.com/CalebDane7/dual-subtitles-srt-skill/stargazers)
-[![Public repo](https://img.shields.io/badge/repo-public-brightgreen)](https://github.com/CalebDane7/dual-subtitles-srt-skill)
-[![Skill](https://img.shields.io/badge/Codex%20%2F%20Claude-skill-blue)](dual-subtitles-srt/SKILL.md)
+[![Codex and Claude skill](https://img.shields.io/badge/agent_skill-Codex_%26_Claude-blue)](dual-subtitles-srt/SKILL.md)
+[![Tests](https://img.shields.io/badge/tests-unittest-brightgreen)](dual-subtitles-srt/tests/test_dual_srt.py)
 
-Build, repair, validate, and prove bilingual movie subtitles in one readable SRT track.
+Build one synchronized movie SRT with the source language above its translation:
+up to two lines per language and four lines total.
 
-This repository contains a portable agent skill for English plus Indonesian dual subtitles. It is designed for Codex, Claude Code, and other agents that can load skill folders. The main use case is simple: take a movie, an English subtitle source, and either an Indonesian subtitle source or a translation path, then produce a single combined SRT that works cleanly in players like Jellyfin, Plex, VLC, mpv, and most TV apps.
+This dual-language subtitle workflow works with any movie that already has a
+trusted, release-matched source transcript and can be read by ffmpeg. It can
+translate each cue with Gemini, context-review every translation before
+installation, keep the source timing, reject broken output, and verify the
+source, target, and combined sidecars.
 
-If this saves you time, star the repo so other people can find it:
+One build command performs both internal language passes: the first creates the
+translation, and the second reviews every cue with surrounding dialogue for
+meaning, natural phrasing, sentence continuity, idioms, wordplay, and speaker
+tone. An incomplete or invalid review cannot publish active movie subtitles.
 
-https://github.com/CalebDane7/dual-subtitles-srt-skill
+Choose any two common language tags accepted by the tool and supported by your
+translation route and target player. English to Indonesian is the tested
+default, not a hard-coded limit.
 
-## The problem this fixes
+For a movie-transcription pipeline in any two supported languages, this skill
+handles the complete dual-language subtitle stage. It does not transcribe audio.
+Builds also normalize cue text, so styling tags and intentional source line
+breaks are not preserved.
 
-Watching with two subtitle tracks sounds easy until the player renders both tracks in the same bottom subtitle band.
+## Quick start
 
-Typical failure modes:
+Translate a release-matched French SRT directly into Japanese:
 
-- English and Indonesian overlap on top of each other.
-- One language loads higher than expected and covers faces or action.
-- The TV app chooses the wrong `.srt` sidecar.
-- A translated subtitle has different cue boundaries than the English file, so the two languages drift apart.
-- Long subtitle lines turn into five, six, or seven visual lines.
-- A downloaded subtitle source has uploader ads, wrong-language text, or timing drift.
-- One movie needs a timing shift, but only one sidecar gets shifted, so English and Indonesian no longer match.
-- The media file itself has an audio/video start offset, but the subtitle file gets blamed.
-- An agent says the job is done because it wrote a file, even though no validation or visual proof was run.
-
-This skill fixes those problems by producing one combined subtitle cue per timestamp:
-
-```text
-English line 1
-English line 2, if needed
-Indonesian line 1
-Indonesian line 2, if needed
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py build \
+  --movie "/movies/Example.mkv" \
+  --source-srt "/movies/Example.fr.srt" \
+  --source-language fr \
+  --target-language ja \
+  --translate gemini
 ```
 
-That layout gives the player one subtitle track to render. English stays above Indonesian. Each cue is capped at four visual lines. The exact-basename `.srt` can be made byte-identical to the validated dual subtitle so the movie auto-loads the right captions.
+The combined cue stays on the source cue's exact timestamps:
 
-## What the skill does
+```text
+source line 1
+source line 2, if needed
+target line 1
+target line 2, if needed
+```
 
-The skill gives an agent a complete workflow for bilingual SRT work:
+The command writes a pair-specific, validated bundle:
 
-- Find the real movie file and its sidecars.
-- Inspect embedded subtitle streams with `ffprobe`.
-- Choose a safe English timing base.
-- Build Indonesian text from a matched Indonesian SRT or by translating English cues.
-- Align Indonesian text to English cue timing.
-- Split long bilingual cues so no cue exceeds four visual lines.
-- Clamp source cue overlaps so the final subtitle track validates cleanly.
-- Write `.en.srt`, `.id.srt`, `.dual.srt`, `.dual.default.srt`, and usually exact-basename `.srt`.
-- Keep `.dual.srt`, `.dual.default.srt`, and plain `.srt` byte-identical when auto-loading is desired.
-- Validate zero cue overlaps, zero blank cues, zero unintended single-language cues, and max four visual lines per cue.
-- Probe audio/video stream starts before timing repairs.
-- Shift every active subtitle sidecar together when a measured timing fix is needed.
-- Render proof frames from the real movie so the agent can inspect the actual subtitle layout.
+```text
+Example.fr.srt
+Example.ja.srt
+Example.ja.translation-cache.json
+Example.ja.semantic-review-cache.json
+Example.dual.srt
+Example.dual.default.srt
+Example.srt
+Example.dual.verify.json
+```
 
-The skill is intentionally script-backed. The rules live in `SKILL.md`, but the fragile work happens in `scripts/dual_srt.py` so agents do not rewrite subtitle parsing, wrapping, timing, backup, and validation logic from scratch each time.
+Validate it:
 
-## Who should use it
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py validate \
+  --movie "/movies/Example.mkv" \
+  --source-language fr \
+  --target-language ja
+```
 
-Use this skill if you:
+English to Indonesian remains the no-extra-flags default:
 
-- Watch movies with English and Indonesian subtitles.
-- Maintain a local Jellyfin, Plex, VLC, or TV-app movie library.
-- Want dual-language captions without vertical overlap.
-- Need agents to repair subtitle timing safely.
-- Want a repeatable subtitle workflow with backups and validation.
-- Need proof frames instead of "trust me" subtitle claims.
-- Are building a Codex or Claude workflow for movie subtitle cleanup.
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py build \
+  --movie "/movies/Example.mkv" \
+  --source-srt "/movies/Example.en.srt" \
+  --translate gemini
+```
 
-It is especially useful for large movie folders where the work needs to be batched, resumed, and proven without corrupting existing sidecars.
+## What it protects
+
+Movie subtitle jobs often fail in ways that look valid at first glance: a
+target-language file contains only cue numbers, malformed SRT blocks disappear
+silently, a stale cache belongs to another language, or the build overwrites
+working files before the final check.
+
+The script treats those as release-blocking failures:
+
+- Strict SRT parsing rejects malformed, missing, non-sequential, or
+  non-positive-duration cues instead of dropping them.
+- Source, target, and combined cue counts and timestamps must match exactly.
+- Every combined cue must equal its source cue followed by its target cue.
+- Blank/null translations, `Cue 12`-style labels, timestamp fragments, numeric
+  placeholders, implausibly short translations, and copied ordinary source
+  dialogue are rejected.
+- A rejected Gemini chunk is retried with the exact cue indexes and failure
+  reasons, including foreign-language dialogue that was copied unchanged.
+- Every first-pass cue receives neighboring source dialogue, including at
+  translation chunk boundaries.
+- In translation mode, before installation, a mandatory second Gemini pass
+  reviews every cue with two cues of source-and-translation context on each
+  side. It checks for and can correct semantic omissions, literal phrasing,
+  duplicated connectors, cross-cue grammar, idioms, wordplay, punctuation,
+  and speaker register.
+- The semantic-review cache is bound to the complete first-pass draft, its
+  context, and the exact rendered review prompt. A changed draft or prompt
+  cannot reuse a stale review, and partial review coverage cannot publish
+  sidecars.
+- Genuine numeric dialogue is still allowed when the source cue is genuinely
+  numeric.
+- Translation caches are bound to exact source text and timing, language pair,
+  requested model selector or pool, transport, rendered prompt hash, prompt
+  version, and validator version. A selector pool may be expanded after a quota
+  failure without discarding validated chunks; selector history is retained.
+- Unicode display width is used for wrapping, including wide and no-space CJK
+  text.
+- A cue that cannot fit two lines per language fails for correction. In
+  translation mode, the script first asks the selected Gemini route for a
+  constrained, meaning-preserving rewrite using the failed draft and an exact
+  display-width budget. It never invents proportional timing to squeeze text
+  in.
+- Source, target, dual, and alias files are built in staging and validated. The
+  sidecars and final verification report are installed in one handled rollback
+  transaction and restored to their original bytes after a handled copy,
+  installed-validation, or final-report failure.
+- The translation and semantic-review caches are separate resumable work state.
+  They are written atomically per update and may retain validated completed
+  chunks after a later provider or build failure.
+- `.dual.default.srt` and exact-basename `.srt` are byte-identical to the
+  validated `.dual.srt` by default.
+
+The result is one subtitle track, so the two languages do not compete for the
+same subtitle area as separate external tracks.
+
+## Start from a trusted transcript
+
+The build command requires a source-language SRT. That source can be:
+
+1. an existing sidecar matched to the exact movie release;
+2. a text subtitle stream extracted from the movie; or
+3. a separately generated speech-recognition transcript that has been checked
+   against the real audio.
+
+This repository does not bundle automatic speech recognition. If the movie has
+no transcript, create and verify one first. A clean transcript from a different
+cut is not a safe timing source.
+
+The compatible flags `--english-source` and `--indonesian-source` remain
+available for existing English-Indonesian workflows. New commands should use
+the generic `--source-srt`, `--target-srt`, `--source-language`, and
+`--target-language` flags.
+
+## Translation modes
+
+Direct Gemini translation is the default workflow because it maps every target
+cue to the trusted source cue's index and timestamps.
+
+### Google Gen AI API
+
+Install the optional package and export your API key through your normal secret
+management:
+
+```bash
+python3 -m pip install google-genai
+```
+
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py build \
+  --movie "/movies/Example.mkv" \
+  --source-srt "/movies/Example.en.srt" \
+  --source-language en \
+  --target-language id \
+  --translate gemini
+```
+
+When `--model` is omitted, the API path tries
+`gemini-pro-latest,gemini-flash-latest,gemini-flash-lite-latest` in that order.
+The `*-latest` aliases can move to newer releases; pass a pinned supported model
+when reproducible output matters.
+
+Receipts and caches label these values as requested model selectors, not as
+proof of one immutable model serving every cue.
+
+### Gemini CLI
+
+Use the signed-in local CLI without placing an API key in the command:
+
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py build \
+  --movie "/movies/Example.mkv" \
+  --source-srt "/movies/Example.en.srt" \
+  --translate gemini-cli
+```
+
+### Mantis Antigravity
+
+Use an already configured Antigravity lane:
+
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py build \
+  --movie "/movies/Example.mkv" \
+  --source-srt "/movies/Example.en.srt" \
+  --translate mantis-antigravity
+```
+
+### Matched source and target SRT files
+
+Translation from the source cue list is preferred. A close release-matched
+target SRT is also supported:
+
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py build \
+  --movie "/movies/Example.mkv" \
+  --source-srt "/movies/Example.es.srt" \
+  --target-srt "/movies/Example.pt-BR.srt" \
+  --source-language es \
+  --target-language pt-BR
+```
+
+Each target cue must overlap one source cue unambiguously. The aligner does not
+pair unrelated dialogue merely because it is nearby, and it never divides words
+proportionally across source cues. Ambiguous or weak overlaps fail so you can
+use direct cue-by-cue translation or a better release-matched target SRT.
+
+## Timing that follows the movie
+
+The script preserves the trusted source SRT's timestamps exactly. Overlapping
+source cues are rejected instead of being trimmed or redistributed. It does not
+pretend that container metadata alone proves that spoken words and subtitles
+match.
+
+Check audio/video stream starts before timing work:
+
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py probe-av \
+  --movie "/movies/Example.mkv"
+```
+
+Then compare real dialogue with source cues near the beginning, middle, and end.
+Also inspect before the first cue and after the last cue for missing dialogue.
+
+If the same signed offset is measured across the movie, shift the entire active
+language pair together:
+
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py shift \
+  --movie "/movies/Example.mkv" \
+  --source-language fr \
+  --target-language ja \
+  --shift-ms 670
+```
+
+A positive value delays subtitles that appear early. A negative value advances
+subtitles that appear late. If the error grows or changes through the movie,
+investigate release mismatch, frame-rate drift, or media A/V sync instead of
+applying one blanket shift.
+
+## Proof from the real movie
+
+Render representative frames using the active combined SRT:
+
+```bash
+python3 dual-subtitles-srt/scripts/dual_srt.py proof \
+  --movie "/movies/Example.mkv" \
+  --out-dir "/tmp/dual-subtitle-proof" \
+  --count 3 \
+  --require-four-line
+```
+
+The proof command samples across the movie, forces one real four-line cue into
+the sample when requested, and compares every rendered frame with an
+unsubtitled baseline to confirm that external subtitle pixels appeared. It can
+also write a JSON receipt with frame and input hashes.
+
+Rendered frames prove layout, not translation meaning or audio sync. The agent
+workflow therefore also requires semantic translation samples and real audio
+checks before it claims a complete movie.
+
+## Install as an agent skill
+
+Clone the repository:
+
+```bash
+git clone https://github.com/CalebDane7/dual-subtitles-srt-skill.git
+cd dual-subtitles-srt-skill
+```
+
+### Codex
+
+The current personal skill discovery path is `~/.agents/skills`:
+
+```bash
+mkdir -p ~/.agents/skills
+ln -sfn "$PWD/dual-subtitles-srt" \
+  ~/.agents/skills/dual-subtitles-srt
+```
+
+Then ask:
+
+```text
+Use $dual-subtitles-srt for this movie. Make English and Indonesian
+subtitles in one synchronized four-line track, translate directly with Gemini,
+validate the complete movie, and render proof frames.
+```
+
+If you name different languages, the same default contract applies.
+
+### Claude Code
+
+```bash
+mkdir -p ~/.claude/skills
+ln -sfn "$PWD/dual-subtitles-srt" \
+  ~/.claude/skills/dual-subtitles-srt
+```
+
+Then ask Claude Code to use the `dual-subtitles-srt` skill and provide the movie
+path plus the two languages.
+
+## Requirements
+
+- Python 3.10 or newer.
+- `ffmpeg` and `ffprobe` for media inspection and rendered proof.
+- One translation route when no matched target SRT is supplied:
+  `google-genai`, Gemini CLI, or Mantis Antigravity.
+
+## Validation guarantees
+
+`validate` checks the complete installed bundle by default:
+
+- strict SRT structure;
+- positive cue durations and monotonic timing;
+- zero cue overlaps;
+- at most two lines per language and four lines total;
+- exact source/target/dual cue count and timing parity;
+- exact source-plus-target composition;
+- zero suspicious translated cues;
+- byte-identical default and plain auto-load aliases; and
+- embedded subtitle stream reporting.
+
+`--srt` can select an alternate combined-SRT path, but `validate` still requires
+the matching source and target sidecars so it can prove timing and composition.
+
+## Output files
+
+For `fr` to `ja`, the normal sidecars are:
+
+| File | Purpose |
+| --- | --- |
+| `Movie.fr.srt` | Normalized source-language cues |
+| `Movie.ja.srt` | Target-language cues on the same timestamps |
+| `Movie.dual.srt` | Combined source-above-target track |
+| `Movie.dual.default.srt` | Byte-identical default alias |
+| `Movie.srt` | Byte-identical exact-basename auto-load alias |
+| `Movie.ja.translation-cache.json` | Translation mode only: source/language/transport/model-selector/prompt-bound resumable cache |
+| `Movie.ja.semantic-review-cache.json` | Translation mode only: draft-and-prompt-bound resumable full-cue semantic-review cache |
+| `Movie.dual.verify.json` | Build and validation receipt |
+
+Existing files are copied into a timestamped backup directory before
+replacement. Use `--output-dir` when you want a separately reviewable bundle
+without writing beside the movie.
+
+## Limits stated plainly
+
+- "Any two languages" means common language tags accepted by this tool and
+  languages supported by the selected translation route and player's renderer.
+- The script does not perform speech recognition.
+- Builds normalize text and do not preserve styling tags or intentional source
+  line breaks.
+- Automated checks catch structural corruption and common bogus translation
+  output; they cannot prove every sentence's meaning.
+- `probe-av` detects mux-level stream-start evidence, not human lip sync.
+- Rendered ffmpeg frames prove layout, not which track a particular TV app will
+  select.
+- An external SRT cannot disable embedded, forced, secondary, or burned-in
+  subtitles. Disable extra tracks in the player or remux when required.
+- Per-file replacement and handled-error rollback are not a crash-atomic
+  multi-file transaction. A forced kill or power loss can require recovery from
+  the timestamped backup.
+- Right-to-left and complex-script rendering depends on the installed libass,
+  fonts, shaping stack, and player. Test the actual target player.
+
+## Tests
+
+Run the regression suite:
+
+```bash
+python3 -B -m unittest discover -s dual-subtitles-srt/tests -v
+python3 -m py_compile dual-subtitles-srt/scripts/dual_srt.py
+```
+
+The suite covers numeric-placeholder rejection, cache isolation, strict SRT
+parsing, four-line wrapping, Unicode/CJK display width, exact bundle
+composition, generic language pairs, and handled-failure rollback.
 
 ## Repository layout
 
@@ -84,306 +406,25 @@ dual-subtitles-srt-skill/
     │   └── openai.yaml
     ├── references/
     │   └── quality-checklist.md
-    └── scripts/
-        └── dual_srt.py
+    ├── scripts/
+    │   └── dual_srt.py
+    └── tests/
+        └── test_dual_srt.py
 ```
 
-Important files:
-
-- `dual-subtitles-srt/SKILL.md` is the agent skill entrypoint.
-- `dual-subtitles-srt/scripts/dual_srt.py` builds, validates, probes, shifts, and proofs subtitles.
-- `dual-subtitles-srt/references/quality-checklist.md` defines the completion bar.
-- `dual-subtitles-srt/agents/openai.yaml` provides UI metadata for skill lists.
-
-## Install for Codex
-
-Clone the repo:
-
-```bash
-git clone https://github.com/CalebDane7/dual-subtitles-srt-skill.git
-cd dual-subtitles-srt-skill
-```
-
-Copy the skill folder into your Codex skills directory:
-
-```bash
-mkdir -p ~/.codex/skills
-cp -R dual-subtitles-srt ~/.codex/skills/
-```
-
-Or symlink it if you want local edits to update immediately:
-
-```bash
-mkdir -p ~/.codex/skills
-ln -sfn "$PWD/dual-subtitles-srt" ~/.codex/skills/dual-subtitles-srt
-```
-
-Then ask Codex:
-
-```text
-Use $dual-subtitles-srt to create English and Indonesian dual subtitles for /path/to/movie.mkv.
-```
-
-## Install for Claude Code
-
-Claude-style skill folders use the same core layout. Clone the repo, then copy or symlink the skill folder into `~/.claude/skills`:
-
-```bash
-git clone https://github.com/CalebDane7/dual-subtitles-srt-skill.git
-cd dual-subtitles-srt-skill
-mkdir -p ~/.claude/skills
-cp -R dual-subtitles-srt ~/.claude/skills/
-```
-
-Symlink option:
-
-```bash
-mkdir -p ~/.claude/skills
-ln -sfn "$PWD/dual-subtitles-srt" ~/.claude/skills/dual-subtitles-srt
-```
-
-Then prompt Claude Code with the skill name and the movie path:
-
-```text
-Use the dual-subtitles-srt skill to build a four-line English plus Indonesian SRT for this movie. Validate it and render proof frames.
-```
-
-## Requirements
-
-Minimum:
-
-- Python 3.10 or newer.
-- `ffmpeg` and `ffprobe` for media probing and proof frames.
-
-Optional translation paths:
-
-- `GEMINI_API_KEY` plus `google-genai` for direct Gemini API translation.
-- Gemini CLI for OAuth-based local translation.
-- Mantis Antigravity for a configured Gemini lane.
-
-Install the optional Python package for direct Gemini API translation:
-
-```bash
-python3 -m pip install google-genai
-```
-
-Check that ffmpeg is available:
-
-```bash
-ffmpeg -version
-ffprobe -version
-```
-
-## Quick start
-
-Build from a matched English SRT and Indonesian SRT:
-
-```bash
-python3 dual-subtitles-srt/scripts/dual_srt.py build \
-  --movie "/movies/Example.Movie.2024.1080p.mkv" \
-  --english-source "/movies/Example.Movie.2024.1080p.en.srt" \
-  --indonesian-source "/movies/Example.Movie.2024.1080p.id.srt" \
-  --make-default \
-  --make-plain
-```
-
-That writes:
-
-```text
-Example.Movie.2024.1080p.en.srt
-Example.Movie.2024.1080p.id.srt
-Example.Movie.2024.1080p.dual.srt
-Example.Movie.2024.1080p.dual.default.srt
-Example.Movie.2024.1080p.srt
-Example.Movie.2024.1080p.dual.verify.json
-```
-
-Validate the output:
-
-```bash
-python3 dual-subtitles-srt/scripts/dual_srt.py validate \
-  --movie "/movies/Example.Movie.2024.1080p.mkv"
-```
-
-Render proof frames:
-
-```bash
-python3 dual-subtitles-srt/scripts/dual_srt.py proof \
-  --movie "/movies/Example.Movie.2024.1080p.mkv" \
-  --count 3 \
-  --out-dir "/tmp/dual-subtitle-proof"
-```
-
-## Translation modes
-
-The best timing source is usually a clean English SRT that matches the exact movie release. Indonesian can come from a matched Indonesian SRT or from translation.
-
-Direct Gemini API:
-
-```bash
-python3 dual-subtitles-srt/scripts/dual_srt.py build \
-  --movie "/movies/Example.Movie.2024.1080p.mkv" \
-  --english-source "/movies/Example.Movie.2024.1080p.en.srt" \
-  --translate gemini \
-  --model gemini-3.1-flash-lite,gemini-2.5-flash-lite \
-  --make-default \
-  --make-plain
-```
-
-Gemini CLI OAuth:
-
-```bash
-python3 dual-subtitles-srt/scripts/dual_srt.py build \
-  --movie "/movies/Example.Movie.2024.1080p.mkv" \
-  --english-source "/movies/Example.Movie.2024.1080p.en.srt" \
-  --translate gemini-cli \
-  --model default \
-  --make-default \
-  --make-plain
-```
-
-Mantis Antigravity:
-
-```bash
-python3 dual-subtitles-srt/scripts/dual_srt.py build \
-  --movie "/movies/Example.Movie.2024.1080p.mkv" \
-  --english-source "/movies/Example.Movie.2024.1080p.en.srt" \
-  --translate mantis-antigravity \
-  --model auto \
-  --make-default \
-  --make-plain
-```
-
-Translation output is cached beside the movie as `.id.translation-cache.json`, so interrupted batches can resume without paying for the same cue translations again.
-The cache is treated as untrusted on every rebuild: if a translated cue is just a cue number, timestamp fragment, or numeric placeholder while the English cue has words, the script discards that cached value and retranslates it.
-
-## Timing repair
-
-Do not blindly shift subtitles. First check whether the media file has an audio/video stream-start offset:
-
-```bash
-python3 dual-subtitles-srt/scripts/dual_srt.py probe-av \
-  --movie "/movies/Example.Movie.2024.1080p.mkv"
-```
-
-If measured subtitle timing is wrong, shift all active subtitle sidecars together:
-
-```bash
-python3 dual-subtitles-srt/scripts/dual_srt.py shift \
-  --movie "/movies/Example.Movie.2024.1080p.mkv" \
-  --shift-ms 670
-```
-
-Use a positive value when subtitles appear too early and need to be delayed. Use a negative value when subtitles appear too late and need to move earlier.
-
-The shift command backs up existing subtitle files, shifts the active sidecars together, updates verification metadata when present, and validates the final dual SRT.
-
-## Validation rules
-
-The validator checks:
-
-- No cue overlaps.
-- No cue has more than four visual lines.
-- No blank cues.
-- No unintended single-language cues.
-- No translated/lower-language cue is just a cue number or numeric placeholder when the English cue has words.
-- `.dual.default.srt` byte-matches `.dual.srt`.
-- Exact-basename `.srt` byte-matches `.dual.srt` when auto-loading is enabled.
-
-Example validator output:
-
-```json
-{
-  "cue_count": 1200,
-  "max_visual_lines_per_cue": 4,
-  "overlap_count": 0,
-  "too_many_line_cues": [],
-  "single_language_or_blank_cues": [],
-  "numeric_translation_line_cues": [],
-  "translation_sidecar_issue_count": 0,
-  "ok": true,
-  ".dual.default.srt_byte_match": true,
-  ".srt_byte_match": true
-}
-```
-
-Validation is necessary, but it is not the finish line. The skill also asks agents to render proof frames from the real movie so a person can inspect readability.
-
-## How agents should use it
-
-A good agent run should follow this pattern:
-
-1. Find the actual movie file.
-2. List existing sidecars.
-3. Back up existing subtitles before replacement.
-4. Choose a clean English timing base.
-5. Translate or align Indonesian text.
-6. Build `.en.srt`, `.id.srt`, `.dual.srt`, `.dual.default.srt`, and plain `.srt`.
-7. Validate the final dual SRT.
-8. Confirm byte-identical auto-load files.
-9. Render proof frames from the real video.
-10. Report what changed and what remains unproven.
-
-Prompt example:
-
-```text
-Use $dual-subtitles-srt on /movies/Upgrade.2018.1080p.mkv.
-Create one English plus Indonesian four-line dual SRT.
-Use English above Indonesian.
-Make the plain .srt auto-load copy.
-Validate it and render proof frames.
-Do not overwrite working sidecars without backups.
-```
-
-## Safety rules
-
-- Do not overwrite good subtitles without backups.
-- Do not use two separate active subtitle tracks for final proof.
-- Do not call the job complete without validation.
-- Do not call the job visually proven without proof frames.
-- Do not apply one movie's timing shift to a whole library.
-- Do not treat mux-level stream timestamps as full lip-sync proof.
-- Do not copy partial translation output into a movie folder after a provider failure.
-- Do not accept translated subtitle lines that only echo cue numbers, even if timing and four-line layout validation pass.
-
-For long batches, build in a temp folder first, validate, then copy the finished sidecars into the movie folder.
-
-## Why this is useful for movie libraries
-
-Large personal libraries get messy fast. One movie has embedded English subtitles. Another has an external English file. Another has Indonesian subtitles from a different release. Another has a plain `.srt` that auto-loads but is not the one you meant to use. A TV app may hide subtitle-track details and simply load whatever sidecar name it recognizes.
-
-This skill makes the final state explicit:
-
-- One active dual-language track.
-- English and Indonesian in one cue.
-- Four visual lines maximum.
-- Matching default and plain auto-load copies.
-- A JSON verification report.
-- Proof frames when the job matters.
-
-That is much easier to audit than a folder full of unrelated `.srt`, `.en.srt`, `.id.srt`, and partially translated files.
-
-## Keywords
-
-Codex skill, Claude skill, Claude Code skill, bilingual subtitles, dual subtitles, dual SRT, English Indonesian subtitles, Indonesian subtitles, SRT repair, subtitle sync, subtitle timing shift, subtitle validation, ffmpeg subtitles, Jellyfin subtitles, Plex subtitles, VLC subtitles, movie subtitles, Gemini translation, Mantis Antigravity, AI agent skill.
+- [`SKILL.md`](dual-subtitles-srt/SKILL.md) defines the agent's complete default
+  workflow.
+- [`dual_srt.py`](dual-subtitles-srt/scripts/dual_srt.py) builds, validates,
+  probes, shifts, and renders proof frames for SRT bundles.
+- [`quality-checklist.md`](dual-subtitles-srt/references/quality-checklist.md)
+  defines the completion gate.
 
 ## Contributing
 
-Issues and pull requests are welcome. Useful contributions include:
+Issues and pull requests are welcome, especially for additional scripts,
+renderers, language pairs, translation transports, and release-matched timing
+edge cases.
 
-- Better subtitle-source filtering.
-- More proof-frame strategies.
-- More translation transports.
-- Better batch tooling for large movie folders.
-- Edge cases for overlapping cues or unusual encodings.
-
-When changing the script, run at least:
-
-```bash
-python3 -m py_compile dual-subtitles-srt/scripts/dual_srt.py
-python3 dual-subtitles-srt/scripts/dual_srt.py build --help
-python3 dual-subtitles-srt/scripts/dual_srt.py validate --help
-python3 dual-subtitles-srt/scripts/dual_srt.py proof --help
-```
-
-For behavior changes, also run a small synthetic build and validate that `.dual.srt`, `.dual.default.srt`, and plain `.srt` match when auto-loading is enabled.
+Behavior changes should include an old-failure regression test and the adjacent
+test suite. Do not weaken the no-placeholder, exact-timing, four-line, backup,
+or handled-install-failure rollback guarantees.

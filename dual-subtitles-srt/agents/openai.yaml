@@ -1,4 +1,4 @@
 interface:
-  display_name: "Dual Subtitles SRT"
-  short_description: "Create and timing-fix verified bilingual SRT subtitles"
-  default_prompt: "Use $dual-subtitles-srt to create or timing-fix synced English and Indonesian dual subtitles for this movie."
+  display_name: "Dual-Language Movie SRT"
+  short_description: "Build and validate bilingual movie SRTs"
+  default_prompt: "Use $dual-subtitles-srt's complete default workflow to build or repair this movie's dual-language SRT from a trusted source transcript: use my two requested languages, translate cue by cue with neighboring context, run the mandatory full-cue Gemini semantic review before installation, preserve exact source timing, keep at most four lines, reject number-only or placeholder text, validate the full bundle, and render proof frames."
